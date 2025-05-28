@@ -1,0 +1,7 @@
+lib
+build
+other-jars
+test-output
+test-output-tests
+testng-*.jar
+target

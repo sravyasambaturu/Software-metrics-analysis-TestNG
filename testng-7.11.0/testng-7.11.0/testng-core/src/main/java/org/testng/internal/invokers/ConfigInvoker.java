@@ -1,0 +1,709 @@
+package org.testng.internal.invokers;
+
+import static org.testng.internal.invokers.InvokedMethodListenerMethod.AFTER_INVOCATION;
+import static org.testng.internal.invokers.InvokedMethodListenerMethod.BEFORE_INVOCATION;
+import static org.testng.internal.invokers.Invoker.SAME_CLASS;
+
+import java.lang.reflect.InvocationTargetException;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import org.testng.ConfigurationNotInvokedException;
+import org.testng.IClass;
+import org.testng.IConfigurable;
+import org.testng.IConfigurationListener;
+import org.testng.IInvokedMethodListener;
+import org.testng.ISuiteRunnerListener;
+import org.testng.ITestClass;
+import org.testng.ITestContext;
+import org.testng.ITestNGMethod;
+import org.testng.ITestResult;
+import org.testng.ListenerComparator;
+import org.testng.Reporter;
+import org.testng.SuiteRunState;
+import org.testng.TestNGException;
+import org.testng.annotations.IConfigurationAnnotation;
+import org.testng.collections.Maps;
+import org.testng.collections.Sets;
+import org.testng.internal.AutoCloseableLock;
+import org.testng.internal.ClassHelper;
+import org.testng.internal.ConfigurationMethod;
+import org.testng.internal.ConstructorOrMethod;
+import org.testng.internal.IConfiguration;
+import org.testng.internal.ITestResultNotifier;
+import org.testng.internal.MethodHelper;
+import org.testng.internal.Parameters;
+import org.testng.internal.RuntimeBehavior;
+import org.testng.internal.TestListenerHelper;
+import org.testng.internal.TestResult;
+import org.testng.internal.Utils;
+import org.testng.internal.annotations.AnnotationHelper;
+import org.testng.internal.invokers.ConfigMethodArguments.Builder;
+import org.testng.internal.thread.ThreadUtil;
+import org.testng.xml.XmlClass;
+import org.testng.xml.XmlSuite;
+
+class ConfigInvoker extends BaseInvoker implements IConfigInvoker {
+
+  /** Test methods whose configuration methods have failed. */
+  protected final Map<ITestNGMethod, Set<Object>> m_methodInvocationResults =
+      Maps.newConcurrentMap();
+
+  private final boolean m_continueOnFailedConfiguration;
+  private boolean m_hasTestTagLevelFailures = false;
+  private boolean m_hasClassLevelFailures = false;
+  private boolean m_hasTestMethodLevelFailures = false;
+
+  private final Set<ITestNGMethod> m_executedConfigMethods = ConcurrentHashMap.newKeySet();
+
+  /** Group failures must be synced as the Invoker is accessed concurrently */
+  private final Map<String, Boolean> m_beforegroupsFailures = Maps.newConcurrentMap();
+
+  private final IConfigurationListener internalConfigurationListener;
+
+  public ConfigInvoker(
+      ITestResultNotifier notifier,
+      Collection<IInvokedMethodListener> invokedMethodListeners,
+      ITestContext testContext,
+      SuiteRunState suiteState,
+      IConfiguration configuration,
+      IConfigurationListener internalConfigurationListener,
+      ISuiteRunnerListener suiteRunner) {
+    super(notifier, invokedMethodListeners, testContext, suiteState, configuration, suiteRunner);
+    this.m_continueOnFailedConfiguration =
+        testContext.getSuite().getXmlSuite().getConfigFailurePolicy()
+            == XmlSuite.FailurePolicy.CONTINUE;
+    this.internalConfigurationListener = internalConfigurationListener;
+  }
+
+  @Override
+  public IConfiguration getConfiguration() {
+    return this.m_configuration;
+  }
+
+  /**
+   * @return false if this class has successfully run all its @Configuration method or true if at
+   *     least one of these methods failed.
+   */
+  public boolean hasConfigurationFailureFor(
+      ITestNGMethod testNGMethod, String[] groups, IClass testClass, Object instance) {
+    return hasConfigurationFailureFor(null, testNGMethod, groups, testClass, instance);
+  }
+
+  @Override
+  public boolean hasConfigurationFailureFor(
+      ITestNGMethod configMethod,
+      ITestNGMethod testNGMethod,
+      String[] groups,
+      IClass testClass,
+      Object instance) {
+    boolean result = false;
+
+    Class<?> cls = testClass.getRealClass();
+
+    if (m_suiteState.isFailed()) {
+      // if there were suite level failures, then short circuit here itself and report them.
+      return true;
+    }
+
+    boolean annotationFound = canIgnoreConfigFailure(testClass, configMethod);
+    boolean hasConfigurationFailures = classConfigurationFailed(cls, instance);
+    if (hasConfigurationFailures) {
+      if (annotationFound) {
+        // We were told to ignore failures via the annotation.
+        return false;
+      }
+      if (m_continueOnFailedConfiguration) {
+        Set<Object> set = getInvocationResults(testClass);
+        result = set.contains(instance);
+      } else {
+        result = true;
+      }
+      return result;
+    }
+    // if method is BeforeClass, currentTestMethod will be null
+    if ((m_continueOnFailedConfiguration || annotationFound) && hasConfigFailure(testNGMethod)) {
+      Object key = TestNgMethodUtils.getMethodInvocationToken(testNGMethod, instance);
+      result = m_methodInvocationResults.get(testNGMethod).contains(key);
+    } else if (!(m_continueOnFailedConfiguration || annotationFound)) {
+      for (Class<?> clazz : m_classInvocationResults.keySet()) {
+        if (clazz.isAssignableFrom(cls) && m_classInvocationResults.get(clazz).contains(instance)) {
+          result = true;
+          break;
+        }
+      }
+    }
+
+    // check if there are failed @BeforeGroups
+    for (String group : groups) {
+      if (m_beforegroupsFailures.containsKey(group)) {
+        result = true;
+        break;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Filter all the beforeGroups methods and invoke only those that apply to the current test method
+   *
+   * @param arguments - A {@link GroupConfigMethodArguments} object.
+   */
+  public void invokeBeforeGroupsConfigurations(GroupConfigMethodArguments arguments) {
+    String[] groups = arguments.getTestMethod().getGroups();
+
+    ITestNGMethod[] beforeMethodsArray =
+        arguments
+            .getGroupMethods()
+            .getBeforeGroupMethodsForGroup(groups)
+            .toArray(new ITestNGMethod[0]);
+
+    //
+    // Invoke the right groups methods
+    //
+    if (beforeMethodsArray.length > 0) {
+      ITestNGMethod[] filteredConfigurations =
+          Arrays.stream(beforeMethodsArray)
+              .filter(ConfigInvoker::isGroupLevelConfigurationMethod)
+              .toArray(ITestNGMethod[]::new);
+      if (filteredConfigurations.length != 0) {
+        // don't pass the IClass or the instance as the method may be external
+        // the invocation must be similar to @BeforeTest/@BeforeSuite
+        ConfigMethodArguments configMethodArguments =
+            new Builder()
+                .usingConfigMethodsAs(filteredConfigurations)
+                .forSuite(arguments.getSuite())
+                .usingParameters(arguments.getParameters())
+                .usingInstance(arguments.getInstance())
+                .forTestMethod(arguments.getTestMethod())
+                .build();
+        invokeConfigurations(configMethodArguments);
+      }
+    }
+
+    //
+    // Remove them so they don't get run again
+    //
+    arguments.getGroupMethods().removeBeforeGroups(groups);
+  }
+
+  private static boolean isGroupLevelConfigurationMethod(ITestNGMethod itm) {
+    return itm.hasBeforeGroupsConfiguration() || itm.hasAfterGroupsConfiguration();
+  }
+
+  public void invokeAfterGroupsConfigurations(GroupConfigMethodArguments arguments) {
+    // Skip this if the current method doesn't belong to any group
+    // (only a method that belongs to a group can trigger the invocation
+    // of afterGroups methods)
+    if (arguments.getTestMethod().getGroups().length == 0) {
+      return;
+    }
+
+    // Got our afterMethods, invoke them
+    Set<String> filteredGroups = new HashSet<>();
+    ITestNGMethod[] filteredConfigurations =
+        arguments.getGroupMethods().getAfterGroupMethods(arguments.getTestMethod()).stream()
+            .peek(t -> filteredGroups.addAll(Arrays.asList(t.getGroups())))
+            .filter(ConfigInvoker::isGroupLevelConfigurationMethod)
+            .toArray(ITestNGMethod[]::new);
+    if (filteredConfigurations.length != 0) {
+      // don't pass the IClass or the instance as the method may be external
+      // the invocation must be similar to @BeforeTest/@BeforeSuite
+      ConfigMethodArguments configMethodArguments =
+          new Builder()
+              .usingConfigMethodsAs(filteredConfigurations)
+              .forSuite(arguments.getSuite())
+              .usingParameters(arguments.getParameters())
+              .usingInstance(arguments.getInstance())
+              .forTestMethod(arguments.getTestMethod())
+              .build();
+
+      invokeConfigurations(configMethodArguments);
+    }
+
+    // Remove the groups so they don't get run again
+    arguments.getGroupMethods().removeAfterGroups(filteredGroups);
+  }
+
+  public void invokeConfigurations(ConfigMethodArguments arguments) {
+    if (arguments.getConfigMethods().length == 0) {
+      log(5, "No configuration methods found");
+      return;
+    }
+
+    ITestNGMethod[] methods =
+        TestNgMethodUtils.filterMethods(
+            null, arguments.getTestClass(), arguments.getConfigMethods(), SAME_CLASS);
+    Object[] parameters = new Object[] {};
+
+    for (ITestNGMethod tm : methods) {
+      if (null == arguments.getTestClass()) {
+        arguments.setTestClass(tm.getTestClass());
+      }
+
+      ITestResult testResult = TestResult.newContextAwareTestResult(tm, m_testContext);
+      testResult.setStatus(ITestResult.STARTED);
+
+      IConfigurationAnnotation configurationAnnotation = null;
+      try {
+        Object inst = tm.getInstance();
+        if (inst == null) {
+          inst = arguments.getInstance();
+        }
+        Class<?> objectClass = inst.getClass();
+        ConstructorOrMethod method = tm.getConstructorOrMethod();
+
+        // Only run the configuration if
+        // - the test is enabled and
+        // - the Configuration method belongs to the same class or a parent
+        configurationAnnotation = AnnotationHelper.findConfiguration(annotationFinder(), method);
+        boolean alwaysRun = MethodHelper.isAlwaysRun(configurationAnnotation);
+        boolean canProcessMethod =
+            MethodHelper.isEnabled(objectClass, annotationFinder()) || alwaysRun;
+        if (!canProcessMethod) {
+          log(
+              3,
+              "Skipping "
+                  + Utils.detailedMethodName(tm, true)
+                  + " because "
+                  + objectClass.getName()
+                  + " is not enabled");
+          continue;
+        }
+        if (!MethodHelper.isEnabled(configurationAnnotation)) {
+          log(3, "Skipping " + Utils.detailedMethodName(tm, true) + " because it is not enabled");
+          continue;
+        }
+        if (hasConfigurationFailureFor(
+                tm,
+                arguments.getTestMethod(),
+                tm.getGroups(),
+                arguments.getTestClass(),
+                arguments.getInstance())
+            && !alwaysRun) {
+          log(3, "Skipping " + Utils.detailedMethodName(tm, true));
+          InvokedMethod invokedMethod = new InvokedMethod(System.currentTimeMillis(), testResult);
+          // Set test result as 'SKIP' in 'beforeConfiguration' & 'beforeInvocation' if
+          // config method is skip.
+          testResult.setStatus(ITestResult.SKIP);
+          runConfigurationListeners(testResult, arguments.getTestMethod(), true /* before */);
+          runInvokedMethodListeners(BEFORE_INVOCATION, invokedMethod, testResult);
+          testResult.setEndMillis(testResult.getStartMillis());
+          runInvokedMethodListeners(AFTER_INVOCATION, invokedMethod, testResult);
+
+          handleConfigurationSkip(
+              tm,
+              testResult,
+              configurationAnnotation,
+              arguments.getTestMethod(),
+              arguments.getInstance(),
+              arguments.getSuite());
+          continue;
+        }
+
+        log(3, "Invoking " + Utils.detailedMethodName(tm, true));
+        if (arguments.getTestMethodResult() != null) {
+          ((TestResult) arguments.getTestMethodResult()).setMethod(arguments.getTestMethod());
+        }
+
+        parameters =
+            Parameters.createConfigurationParameters(
+                tm.getConstructorOrMethod().getMethod(),
+                arguments.getParameters(),
+                arguments.getParameterValues(),
+                arguments.getTestMethod(),
+                annotationFinder(),
+                arguments.getSuite(),
+                m_testContext,
+                arguments.getTestMethodResult());
+        testResult.setParameters(parameters);
+
+        runConfigurationListeners(testResult, arguments.getTestMethod(), true /* before */);
+
+        Object newInstance = computeInstance(arguments.getInstance(), inst, tm);
+        boolean isFirstTimeOnlyConfigMethod = isConfigMethodEligibleForScrutiny(tm);
+        if (isFirstTimeOnlyConfigMethod) {
+          if (m_executedConfigMethods.add(arguments.getTestMethod())) {
+            invokeConfigurationMethod(newInstance, tm, parameters, testResult);
+          }
+        } else {
+          invokeConfigurationMethod(newInstance, tm, parameters, testResult);
+        }
+        copyAttributesFromNativelyInjectedTestResult(parameters, arguments.getTestMethodResult());
+        if (!isFirstTimeOnlyConfigMethod) {
+          runConfigurationListeners(testResult, arguments.getTestMethod(), false /* after */);
+        }
+        if (testResult.getStatus() == ITestResult.SKIP) {
+          Throwable t = testResult.getThrowable();
+          if (t != null) {
+            throw t;
+          }
+        }
+      } catch (Throwable ex) {
+        handleConfigurationFailure(
+            ex,
+            tm,
+            testResult,
+            configurationAnnotation,
+            arguments.getTestMethod(),
+            arguments.getInstance(),
+            arguments.getSuite());
+        copyAttributesFromNativelyInjectedTestResult(parameters, arguments.getTestMethodResult());
+      }
+    } // for methods
+  }
+
+  /** Effectively invokes a configuration method on all passed in instances. */
+  // TODO: Change this method to be more like invokeMethod() so that we can handle calls to {@code
+  // IInvokedMethodListener} better.
+  private void invokeConfigurationMethod(
+      Object targetInstance, ITestNGMethod tm, Object[] params, ITestResult testResult)
+      throws InvocationTargetException, IllegalAccessException {
+    // Mark this method with the current thread id
+    tm.setId(ThreadUtil.currentThreadInfo());
+
+    InvokedMethod invokedMethod = new InvokedMethod(System.currentTimeMillis(), testResult);
+
+    runInvokedMethodListeners(BEFORE_INVOCATION, invokedMethod, testResult);
+
+    if (tm instanceof IInvocationStatus) {
+      ((IInvocationStatus) tm).setInvokedAt(invokedMethod.getDate());
+    }
+    if (testResult.getStatus() == ITestResult.SKIP) {
+      // There was a skip marked by the listener invocation.
+      testResult.setEndMillis(System.currentTimeMillis());
+      Reporter.setCurrentTestResult(testResult);
+      runInvokedMethodListeners(AFTER_INVOCATION, invokedMethod, testResult);
+
+      Reporter.setCurrentTestResult(null);
+      return;
+    }
+    try {
+      Reporter.setCurrentTestResult(testResult);
+      ConstructorOrMethod method = tm.getConstructorOrMethod();
+
+      IConfigurable configurableInstance = computeConfigurableInstance(method, targetInstance);
+      if (RuntimeBehavior.isDryRun()) {
+        testResult.setStatus(ITestResult.SUCCESS);
+        return;
+      }
+      boolean willfullyIgnored = false;
+      boolean usesConfigurableInstance = configurableInstance != null;
+      if (usesConfigurableInstance) {
+        willfullyIgnored =
+            !MethodInvocationHelper.invokeConfigurable(
+                targetInstance, params, configurableInstance, method.getMethod(), testResult);
+      } else {
+        MethodInvocationHelper.invokeMethodConsideringTimeout(
+            tm, method, targetInstance, params, testResult, m_configuration);
+      }
+      boolean testStatusRemainedUnchanged = testResult.isNotRunning();
+      boolean throwException = !RuntimeBehavior.ignoreCallbackInvocationSkips();
+      if (throwException
+          && usesConfigurableInstance
+          && willfullyIgnored
+          && testStatusRemainedUnchanged) {
+        throw new ConfigurationNotInvokedException(tm);
+      }
+      testResult.setStatus(ITestResult.SUCCESS);
+    } catch (ConfigurationNotInvokedException
+        | InvocationTargetException
+        | IllegalAccessException ex) {
+      throwConfigurationFailure(testResult, ex);
+      testResult.setStatus(ITestResult.FAILURE);
+      throw ex;
+    } catch (Throwable ex) {
+      throwConfigurationFailure(testResult, ex);
+      testResult.setStatus(ITestResult.FAILURE);
+      throw new TestNGException(ex);
+    } finally {
+      testResult.setEndMillis(System.currentTimeMillis());
+      Reporter.setCurrentTestResult(testResult);
+      runInvokedMethodListeners(AFTER_INVOCATION, invokedMethod, testResult);
+      Reporter.setCurrentTestResult(null);
+    }
+  }
+
+  private void throwConfigurationFailure(ITestResult testResult, Throwable ex) {
+    testResult.setStatus(ITestResult.FAILURE);
+    testResult.setThrowable(ex.getCause() == null ? ex : ex.getCause());
+  }
+
+  private IConfigurable computeConfigurableInstance(
+      ConstructorOrMethod method, Object targetInstance) {
+    return IConfigurable.class.isAssignableFrom(method.getDeclaringClass())
+        ? (IConfigurable) targetInstance
+        : m_configuration.getConfigurable();
+  }
+
+  private void runConfigurationListeners(ITestResult tr, ITestNGMethod tm, boolean before) {
+    ListenerComparator comparator = m_configuration.getListenerComparator();
+    if (before) {
+      TestListenerHelper.runPreConfigurationListeners(
+          tr,
+          tm,
+          m_notifier.getConfigurationListeners(),
+          internalConfigurationListener,
+          comparator);
+    } else {
+      TestListenerHelper.runPostConfigurationListeners(
+          tr,
+          tm,
+          m_notifier.getConfigurationListeners(),
+          internalConfigurationListener,
+          comparator);
+    }
+  }
+
+  /** Marks the current <code>TestResult</code> as skipped and invokes the listeners. */
+  private void handleConfigurationSkip(
+      ITestNGMethod tm,
+      ITestResult testResult,
+      IConfigurationAnnotation annotation,
+      ITestNGMethod currentTestMethod,
+      Object instance,
+      XmlSuite suite) {
+    recordConfigurationInvocationFailed(
+        tm, testResult.getTestClass(), annotation, currentTestMethod, instance, suite);
+    testResult.setStatus(ITestResult.SKIP);
+    runConfigurationListeners(testResult, currentTestMethod, false /* after */);
+  }
+
+  private boolean hasConfigFailure(ITestNGMethod currentTestMethod) {
+    return currentTestMethod != null && m_methodInvocationResults.containsKey(currentTestMethod);
+  }
+
+  private void handleConfigurationFailure(
+      Throwable ite,
+      ITestNGMethod tm,
+      ITestResult testResult,
+      IConfigurationAnnotation annotation,
+      ITestNGMethod currentTestMethod,
+      Object instance,
+      XmlSuite suite) {
+    Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
+
+    if (isSkipExceptionAndSkip(cause)) {
+      testResult.setThrowable(cause);
+      handleConfigurationSkip(tm, testResult, annotation, currentTestMethod, instance, suite);
+      return;
+    }
+    Utils.log(
+        "",
+        3,
+        "Failed to invoke configuration method "
+            + tm.getQualifiedName()
+            + ":"
+            + cause.getMessage());
+    handleException(cause, tm, testResult, 1);
+    testResult.setStatus(ITestResult.FAILURE);
+    runConfigurationListeners(testResult, currentTestMethod, false /* after */);
+
+    //
+    // If in TestNG mode, need to take a look at the annotation to figure out
+    // what kind of @Configuration method we're dealing with
+    //
+    if (null != annotation) {
+      recordConfigurationInvocationFailed(
+          tm, testResult.getTestClass(), annotation, currentTestMethod, instance, suite);
+    }
+  }
+
+  private static boolean isConfigMethodEligibleForScrutiny(ITestNGMethod tm) {
+    if (!tm.isBeforeMethodConfiguration()) {
+      return false;
+    }
+    if (!(tm instanceof ConfigurationMethod)) {
+      return false;
+    }
+    ConfigurationMethod cfg = (ConfigurationMethod) tm;
+    return cfg.isFirstTimeOnly();
+  }
+
+  /** @return true if this class or a parent class failed to initialize. */
+  private boolean classConfigurationFailed(Class<?> cls, Object instance) {
+    return m_classInvocationResults.entrySet().stream()
+        .anyMatch(
+            classSetEntry -> {
+              Set<Object> obj = classSetEntry.getValue();
+              Class<?> c = classSetEntry.getKey();
+              boolean containsBeforeTestOrBeforeSuiteFailure = obj.contains(NULL_OBJECT);
+              return c == cls
+                  || c.isAssignableFrom(cls)
+                      && (obj.contains(instance) || containsBeforeTestOrBeforeSuiteFailure);
+            });
+  }
+
+  private static void copyAttributesFromNativelyInjectedTestResult(
+      Object[] source, ITestResult target) {
+    if (source == null || target == null) {
+      return;
+    }
+    Arrays.stream(source)
+        .filter(each -> each instanceof ITestResult)
+        .findFirst()
+        .ifPresent(eachSource -> TestResult.copyAttributes((ITestResult) eachSource, target));
+  }
+
+  private void setMethodInvocationFailure(ITestNGMethod method, Object instance) {
+    if (method == null) {
+      return;
+    }
+    Set<Object> instances =
+        m_methodInvocationResults.computeIfAbsent(method, k -> Sets.newHashSet());
+    instances.add(TestNgMethodUtils.getMethodInvocationToken(method, instance));
+  }
+
+  private final AutoCloseableLock internalLock = new AutoCloseableLock();
+
+  private void setClassInvocationFailure(Class<?> clazz, Object instance) {
+    try (AutoCloseableLock ignore = internalLock.lock()) {
+      Set<Object> instances =
+          m_classInvocationResults.computeIfAbsent(clazz, k -> Sets.newHashSet());
+      Object objectToAdd = instance == null ? NULL_OBJECT : instance;
+      instances.add(objectToAdd);
+    }
+  }
+
+  /**
+   * Record internally the failure of a Configuration, so that we can determine later if @Test
+   * should be skipped.
+   */
+  private void recordConfigurationInvocationFailed(
+      ITestNGMethod tm,
+      IClass testClass,
+      IConfigurationAnnotation annotation,
+      ITestNGMethod currentTestMethod,
+      Object instance,
+      XmlSuite suite) {
+    // If beforeTestClass or afterTestClass failed, mark either the config method's
+    // entire class as failed, or the class under tests as failed, depending on
+    // the configuration failure policy
+    if (annotation.getBeforeTestClass() || annotation.getAfterTestClass()) {
+      // tm is the configuration method, and currentTestMethod is null for BeforeClass
+      // methods, so we need testClass
+      Class<?> clazzToUse = tm.getRealClass();
+      if (m_continueOnFailedConfiguration || annotation.isIgnoreFailure()) {
+        clazzToUse = testClass.getRealClass();
+      }
+      setClassInvocationFailure(clazzToUse, instance);
+      if (annotation.getBeforeTestClass()) {
+        m_hasClassLevelFailures = true;
+      }
+    }
+
+    // If before/afterTestMethod failed, mark either the config method's entire
+    // class as failed, or just the current test method as failed, depending on
+    // the configuration failure policy
+    else if (annotation.getBeforeTestMethod() || annotation.getAfterTestMethod()) {
+      if (m_continueOnFailedConfiguration || canIgnoreConfigFailure(tm)) {
+        setMethodInvocationFailure(currentTestMethod, instance);
+      } else {
+        setClassInvocationFailure(tm.getRealClass(), instance);
+      }
+      if (annotation.getBeforeTestMethod()) {
+        m_hasTestMethodLevelFailures = true;
+      }
+    }
+
+    // If beforeSuite or afterSuite failed, mark *all* the classes as failed
+    // for configurations.  At this point, the entire Suite is screwed
+    else if (annotation.getBeforeSuite() || annotation.getAfterSuite()) {
+      m_suiteState.failed();
+    }
+
+    // beforeTest or afterTest:  mark all the classes in the same
+    // <test> stanza as failed for configuration
+    else if (annotation.getBeforeTest() || annotation.getAfterTest()) {
+      setClassInvocationFailure(tm.getRealClass(), instance);
+      XmlClass[] classes = ClassHelper.findClassesInSameTest(tm.getRealClass(), suite);
+      for (XmlClass xmlClass : classes) {
+        setClassInvocationFailure(xmlClass.getSupportClass(), instance);
+      }
+      if (annotation.getBeforeTest()) {
+        m_hasTestTagLevelFailures = true;
+      }
+    }
+    String[] beforeGroups = annotation.getBeforeGroups();
+    for (String group : beforeGroups) {
+      m_beforegroupsFailures.put(group, Boolean.FALSE);
+    }
+  }
+
+  private static Object computeInstance(Object instance, Object inst, ITestNGMethod tm) {
+    if (instance == null
+        || !tm.getConstructorOrMethod().getDeclaringClass().isAssignableFrom(instance.getClass())) {
+      return inst;
+    }
+    return instance;
+  }
+
+  private Set<Object> getInvocationResults(IClass testClass) {
+    Class<?> cls = testClass.getRealClass();
+    Set<Object> set = null;
+    // We need to continuously search till either our Set is not null (or) till we reached
+    // Object class because it is very much possible that the test method is residing in a child
+    // class
+    // and maybe the parent method has configuration methods which may have had a failure
+    // So lets walk up the inheritance tree until either we find failures or till we
+    // reached the Object class.
+    while (!cls.equals(Object.class)) {
+      set = m_classInvocationResults.get(cls);
+      if (set != null) {
+        break;
+      }
+      cls = cls.getSuperclass();
+    }
+    if (set == null) {
+      // This should never happen because we have walked up all the way till Object class
+      // and yet found no failures, but our logic indicates that there was a failure somewhere up
+      // the
+      // inheritance order. We don't know what to do at this point.
+      throw new IllegalStateException("No failure logs for " + testClass.getRealClass());
+    }
+    return set;
+  }
+
+  private static boolean canIgnoreConfigFailure(ITestNGMethod method) {
+    if (method == null) {
+      return false;
+    }
+    return method.isIgnoreFailure();
+  }
+
+  private boolean canIgnoreConfigFailure(IClass testClass, ITestNGMethod configMethod) {
+    boolean instanceMatch = testClass instanceof ITestClass;
+    if (!instanceMatch) {
+      return false;
+    }
+    ITestClass tc = ((ITestClass) testClass);
+    ITestNGMethod[] methods = new ITestNGMethod[] {};
+    if (configMethod == null) { // We are dealing with a test method that is doing the checking
+      // First check if there were any @BeforeMethods that had the isIgnoreFailure flag.
+      if (m_hasTestMethodLevelFailures) {
+        methods = tc.getBeforeTestMethods();
+      } else if (m_hasClassLevelFailures) {
+        // If no @BeforeMethod were found, then we move to @BeforeClass
+        methods = tc.getBeforeClassMethods();
+      } else if (m_hasTestTagLevelFailures) {
+        // If no @BeforeClass were found, then we move to @BeforeTest
+        methods = tc.getBeforeTestConfigurationMethods();
+      }
+    } else { // We are dealing with a config method that is doing the checking
+      // First check if there were any @BeforeTest that had the isIgnoreFailure flag.
+      if (m_hasTestTagLevelFailures) {
+        methods = tc.getBeforeTestConfigurationMethods();
+      } else if (m_hasClassLevelFailures) {
+        // if no @BeforeTest were found, then we move to @BeforeClass
+        methods = tc.getBeforeClassMethods();
+      } else if (m_hasTestMethodLevelFailures) {
+        // if no @BeforeClass were found, then we move to @BeforeMethod
+        methods = tc.getBeforeTestMethods();
+      }
+    }
+    return Arrays.stream(methods).anyMatch(ITestNGMethod::isIgnoreFailure);
+  }
+}

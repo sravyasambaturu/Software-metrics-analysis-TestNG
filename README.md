@@ -40,9 +40,8 @@ This dataset and analysis are archived at Zenodo:
 
 - [Understand](https://scitools.com/) (for static code analysis)
 - Python + Pandas + SciPy (for statistical tests)
-- Jupyter Notebooks
-- ChatGPT (for grammar and clarity refinement)
-
+- Google Collab Notebooks
+- [TestNG Testing Framework](https://github.com/testng-team/testng)
 ---
 
 © 2025 | Research project on software quality evolution using static code metrics.
